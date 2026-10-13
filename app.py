@@ -196,13 +196,37 @@ def download():
 
     tmp_dir = tempfile.mkdtemp()
 
+    # Cookie file — Render secret file location
+    cookie_file = os.environ.get("COOKIE_FILE", "/etc/secrets/cookies.txt")
+    use_cookies = os.path.exists(cookie_file)
+
     ydl_opts = {
         "format": fmt,
         "outtmpl": os.path.join(tmp_dir, "%(title)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "merge_output_format": "mp4" if not audio_only else None,
+        # Bot detection bypass
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web", "android"],
+                "player_skip": ["webpage", "configs"],
+            }
+        },
+        "socket_timeout": 30,
+        "retries": 3,
     }
+
+    if use_cookies:
+        ydl_opts["cookiefile"] = cookie_file
 
     if audio_only:
         ydl_opts["postprocessors"] = [{
