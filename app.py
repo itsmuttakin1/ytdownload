@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 # app.py — YouTube Downloader Web App (Flask + yt-dlp)
-# Deploy: Render.com (free tier)
+# Deploy: Render.com
 
 import os
 import tempfile
 import threading
+import logging
 import yt_dlp
 from flask import Flask, request, jsonify, send_file, render_template_string
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -61,9 +65,7 @@ HTML = """
       border: none;
       border-radius: 8px;
       cursor: pointer;
-      transition: background 0.2s;
     }
-    button:hover { background: #cc3333; }
     button:disabled { background: #555; cursor: not-allowed; }
     #status {
       margin-top: 18px;
@@ -115,13 +117,10 @@ async function startDownload() {
   const btn = document.getElementById('btn');
   const status = document.getElementById('status');
 
-  if (!url) {
-    setStatus('URL dao first.', 'error');
-    return;
-  }
+  if (!url) { setStatus('URL dao first.', 'error'); return; }
 
   btn.disabled = true;
-  setStatus('<span class="spinner"></span> Fetching video info...', '');
+  setStatus('<span class="spinner"></span> Downloading... (time lagbe, wait koro)', '');
 
   try {
     const res = await fetch('/download', {
@@ -137,24 +136,20 @@ async function startDownload() {
       return;
     }
 
-    setStatus('<span class="spinner"></span> Downloading...', '');
-
     const blob = await res.blob();
     const disposition = res.headers.get('Content-Disposition') || '';
-    const nameMatch = disposition.match(/filename="?(.+?)"?$/);
-    const filename = nameMatch ? nameMatch[1] : 'video.mp4';
+    const nameMatch = disposition.match(/filename[^;=\\n]*=(?:(['"])(.*?)\\1|([^;\\n]*))/);
+    const filename = (nameMatch && (nameMatch[2] || nameMatch[3])) || 'video.mp4';
 
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = filename;
+    a.download = decodeURIComponent(filename);
     a.click();
     URL.revokeObjectURL(a.href);
-
     setStatus('Download complete!', 'success');
   } catch (e) {
-    setStatus('Network error. Try again.', 'error');
+    setStatus('Network error: ' + e.message, 'error');
   }
-
   btn.disabled = false;
 }
 
@@ -176,10 +171,43 @@ QUALITY_MAP = {
     "audio": "bestaudio/best",
 }
 
+# Cookie file — multiple locations try korbe
+COOKIE_PATHS = [
+    "/etc/secrets/cookies.txt",
+    os.path.join(os.path.dirname(__file__), "cookies.txt"),
+    "cookies.txt",
+]
+
+def find_cookie_file():
+    env_path = os.environ.get("COOKIE_FILE")
+    if env_path and os.path.exists(env_path):
+        logger.info(f"Cookie found via env: {env_path}")
+        return env_path
+    for path in COOKIE_PATHS:
+        if os.path.exists(path):
+            logger.info(f"Cookie found: {path}")
+            return path
+    logger.warning("No cookie file found — proceeding without cookies")
+    return None
+
 
 @app.route("/")
 def index():
     return render_template_string(HTML)
+
+
+@app.route("/debug")
+def debug():
+    """Cookie status check — /debug a giye dekho"""
+    cookie = find_cookie_file()
+    return jsonify({
+        "cookie_file": cookie,
+        "cookie_exists": cookie is not None,
+        "checked_paths": COOKIE_PATHS,
+        "env_COOKIE_FILE": os.environ.get("COOKIE_FILE"),
+        "cwd": os.getcwd(),
+        "dir_contents": os.listdir("."),
+    })
 
 
 @app.route("/download", methods=["POST"])
@@ -193,20 +221,15 @@ def download():
 
     fmt = QUALITY_MAP.get(quality, QUALITY_MAP["720"])
     audio_only = quality == "audio"
-
     tmp_dir = tempfile.mkdtemp()
-
-    # Cookie file — Render secret file location
-    cookie_file = os.environ.get("COOKIE_FILE", "/etc/secrets/cookies.txt")
-    use_cookies = os.path.exists(cookie_file)
+    cookie_file = find_cookie_file()
 
     ydl_opts = {
         "format": fmt,
         "outtmpl": os.path.join(tmp_dir, "%(title)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": False,
+        "no_warnings": False,
         "merge_output_format": "mp4" if not audio_only else None,
-        # Bot detection bypass
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -217,16 +240,18 @@ def download():
         },
         "extractor_args": {
             "youtube": {
-                "player_client": ["web", "android"],
-                "player_skip": ["webpage", "configs"],
+                "player_client": ["android", "web"],
             }
         },
-        "socket_timeout": 30,
-        "retries": 3,
+        "socket_timeout": 60,
+        "retries": 5,
     }
 
-    if use_cookies:
+    if cookie_file:
         ydl_opts["cookiefile"] = cookie_file
+        logger.info(f"Using cookie: {cookie_file}")
+    else:
+        logger.warning("Downloading without cookies")
 
     if audio_only:
         ydl_opts["postprocessors"] = [{
@@ -240,14 +265,13 @@ def download():
             info = ydl.extract_info(url, download=True)
             title = info.get("title", "video")
 
-        # Find the downloaded file
         files = os.listdir(tmp_dir)
         if not files:
-            return jsonify({"error": "Download failed — no file produced"}), 500
+            return jsonify({"error": "Download failed — no output file"}), 500
 
         filepath = os.path.join(tmp_dir, files[0])
         ext = os.path.splitext(files[0])[1]
-        safe_title = "".join(c for c in title if c.isalnum() or c in " _-")[:80]
+        safe_title = "".join(c for c in title if c.isalnum() or c in " _-")[:80].strip()
         download_name = f"{safe_title}{ext}"
 
         def cleanup():
@@ -257,17 +281,15 @@ def download():
             except Exception:
                 pass
 
-        response = send_file(
-            filepath,
-            as_attachment=True,
-            download_name=download_name,
-        )
+        resp = send_file(filepath, as_attachment=True, download_name=download_name)
         threading.Thread(target=cleanup, daemon=True).start()
-        return response
+        return resp
 
     except yt_dlp.utils.DownloadError as e:
+        logger.error(f"yt-dlp error: {e}")
         return jsonify({"error": str(e)}), 400
     except Exception as e:
+        logger.error(f"Server error: {e}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 
